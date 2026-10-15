@@ -1,4 +1,5 @@
 import { verifySignatureAppRouter } from "@upstash/qstash/nextjs";
+import { envoyerNotification } from "@/lib/email";
 import { genererFiche } from "@/lib/generer-fiche";
 import { ErreurIA, messageErreurIA } from "@/lib/ia";
 import { NOMBRE_REESSAIS } from "@/lib/qstash";
@@ -6,12 +7,41 @@ import { creerClientAdmin } from "@/lib/supabase/admin";
 
 export const maxDuration = 60;
 
+type ClientAdmin = ReturnType<typeof creerClientAdmin>;
+
 function estReessayable(erreur: unknown): boolean {
   if (erreur instanceof ErreurIA) {
     return erreur.status === 429 || erreur.status >= 500;
   }
   // Délai dépassé, panne réseau ou erreur inattendue : une nouvelle tentative peut réussir
   return true;
+}
+
+// Effet secondaire : un échec d'envoi est journalisé, mais ne fait jamais échouer le traitement
+async function notifier(
+  supabase: ClientAdmin,
+  fiche: { id: string; titre: string; user_id: string },
+  statut: "prete" | "erreur",
+  messageErreur?: string
+) {
+  try {
+    const { data, error } = await supabase.auth.admin.getUserById(fiche.user_id);
+    const destinataire = data.user?.email;
+
+    if (error || !destinataire) {
+      throw new Error("Adresse e-mail de l'auteur introuvable.");
+    }
+
+    await envoyerNotification({
+      destinataire,
+      ficheId: fiche.id,
+      titre: fiche.titre,
+      statut,
+      messageErreur,
+    });
+  } catch (erreur) {
+    console.error("Échec de l'envoi de la notification :", erreur);
+  }
 }
 
 async function traiter(request: Request) {
@@ -23,7 +53,7 @@ async function traiter(request: Request) {
 
   const { data: fiche } = await supabase
     .from("fiches")
-    .select("id, titre, texte_source, statut")
+    .select("id, titre, texte_source, statut, user_id")
     .eq("id", ficheId)
     .maybeSingle();
 
@@ -45,6 +75,8 @@ async function traiter(request: Request) {
       })
       .eq("id", fiche.id);
 
+    await notifier(supabase, fiche, "prete");
+
     return Response.json({ resultat: "prête" });
   } catch (erreur) {
     console.error(`Échec de la génération (tentative ${tentative + 1}) :`, erreur);
@@ -54,11 +86,15 @@ async function traiter(request: Request) {
       return Response.json({ resultat: "nouvelle tentative" }, { status: 500 });
     }
 
-    // Erreur définitive ou dernière tentative : on enregistre l'échec
+    // Erreur définitive ou dernière tentative : on enregistre l'échec et on prévient l'auteur
+    const message = messageErreurIA(erreur);
+
     await supabase
       .from("fiches")
-      .update({ statut: "erreur", message_erreur: messageErreurIA(erreur) })
+      .update({ statut: "erreur", message_erreur: message })
       .eq("id", fiche.id);
+
+    await notifier(supabase, fiche, "erreur", message);
 
     return Response.json({ resultat: "erreur" });
   }
